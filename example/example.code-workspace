@@ -1,0 +1,42 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "${workspaceRoot}/../../../../libs/openFrameworks"
+		},
+		{
+			"path": "${workspaceRoot}/../../../ofxGui"
+		},
+		{
+			"path": "${workspaceRoot}/../.."
+		},
+		{
+			"path": "${workspaceRoot}/../../../ofxGui"
+		},
+		{
+			"path": "${workspaceRoot}/../.."
+		},
+		{
+			"path": "${workspaceRoot}/../../../ofxGui"
+		},
+		{
+			"path": "${workspaceRoot}/../.."
+		},
+		{
+			"path": "${workspaceRoot}/../../../ofxGui"
+		},
+		{
+			"path": "${workspaceRoot}/../.."
+		},
+		{
+			"path": "${workspaceRoot}/../../../ofxGui"
+		},
+		{
+			"path": "${workspaceRoot}/../.."
+		}
+	],
+	"openFrameworksProjectGeneratorVersion": "0.104.0",
+	"settings": {}
+}
