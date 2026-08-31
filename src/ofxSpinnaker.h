@@ -3,7 +3,6 @@
 #include "ofMain.h"
 #include "Spinnaker.h"
 #include "SpinGenApi/SpinnakerGenApi.h"
-#include "ofThread.h"
 #include "ofJson.h"
 
 #include <atomic>
@@ -49,7 +48,15 @@ private:
 };
 
 
-class ofxSpinnakerCamera : public ofThread {
+// A control's real-time behavior, discovered empirically from the camera rather
+// than guessed from its name: whether it can be changed while the camera is
+// streaming, or whether the stream must briefly be stopped to change it.
+enum class ofxSpinnakerControlClass {
+    RealTime,
+    StopCaptureRequired
+};
+
+class ofxSpinnakerCamera : public Spinnaker::ImageEventHandler {
 public:
     explicit ofxSpinnakerCamera(Spinnaker::CameraPtr cameraPtr);
     ~ofxSpinnakerCamera() override;
@@ -77,18 +84,32 @@ public:
     bool consumeGuiRefreshFlag();
     void setConfigurationDirectory(const std::string& directory);
 
+    // Live query for GUI layers: is this parameter's underlying GenICam node
+    // currently writable? Backed by a fresh IsWritable()/IsAvailable() check on
+    // the cached node, so it reflects Auto/Manual dependencies (e.g. ExposureAuto
+    // != Off disabling ExposureTime) the instant they change, without needing a
+    // full parameter-tree rebuild.
+    bool isParameterCurrentlyWritable(const ofAbstractParameter& parameter) const;
+
+    // Returns the enum's display-name entries (in the same order as the
+    // ofParameter<int>'s underlying index) if this parameter is an
+    // enumeration, or nullptr otherwise. Pointer-keyed so callers never need
+    // to know the addon's internal GenICam node-path naming.
+    const std::vector<std::string>* getEnumEntryNames(const ofAbstractParameter& parameter) const;
+
 private:
     using NodePtr = Spinnaker::GenApi::CNodePtr;
 
-    void threadedFunction() override;
+    void OnImageEvent(Spinnaker::ImagePtr image) override;
 
     void buildParameterTree();
     void buildInfoGroup(Spinnaker::GenApi::INodeMap& nodeMap);
     void traverseNode(NodePtr node,
-                      ofParameterGroup& container,
-                      const std::string& sectionName,
-                      unsigned int depth = 0,
+                      ofParameterGroup& liveContainer,
+                      ofParameterGroup& reconfigureContainer,
                       const std::string& currentPath = "");
+    void configureStreamBuffering();
+    void classifyControlGroups();
     void attachParameterListener();
     void rebuildParameters();
 
@@ -107,7 +128,9 @@ private:
 
     void stopAcquisitionForCriticalChange(const std::function<void()>& fn);
 
-    bool isCriticalNode(const std::string& nodeName) const;
+    bool isStopCaptureRequired(const std::string& path) const;
+
+    void resetGevHeartbeatIfPresent();
 
     void loadConfiguration();
     void saveConfiguration();
@@ -120,8 +143,18 @@ private:
                                    const ofJson& values);
     void markConfigurationDirty();
 
+    // Walk only Live/Reconfigure controls for JSON persistence, skipping the
+    // read-only Info group (already captured under the "device" key) and,
+    // crucially, not folding the "Live Controls"/"Reconfigure Controls" bucket
+    // names into the path - those buckets can move a control between them on
+    // reclassification, but the underlying GenICam node path (and therefore
+    // the JSON key) must stay stable.
+    void collectAllParameters(ofJson& collection) const;
+    void applyAllParametersFromJson(const ofJson& values);
+
     Spinnaker::CameraPtr camera;
     Spinnaker::ImageProcessor processor;
+    bool imageEventHandlerRegistered = false;
 
     mutable std::mutex frameMutex;
     ofPixels pixels;
@@ -133,7 +166,6 @@ private:
     ofParameterGroup liveParameters;
     ofParameterGroup reconfigureParameters;
     ofParameterGroup infoParameters;
-    ofParameterGroup advancedParameters;
 
     std::unordered_map<std::string, NodePtr> writableNodes;
     std::unordered_map<std::string, std::vector<std::string>> enumDisplayNames;
@@ -141,9 +173,18 @@ private:
     std::unordered_map<const ofAbstractParameter*, std::string> parameterPaths;
     std::unordered_set<std::string> selectorParameterPaths;
 
+    // Discovered once per camera (see classifyControlGroups()): which nodes
+    // actually require the stream to be stopped to change, versus which remain
+    // writable while streaming. Persists across rebuilds so re-classification
+    // only has to happen for genuinely new node paths.
+    std::unordered_map<std::string, ofxSpinnakerControlClass> nodeClassification;
+    std::unordered_map<std::string, bool> preStreamWritableSnapshot;
+    bool controlsClassified = false;
+
     ofEventListener parameterListener;
     bool listenerAttached = false;
     bool rebuildingParameters = false;
+    bool pendingRebuildRequested = false;
     bool loadingConfiguration = false;
     bool skipConfigReload = false;
     std::atomic<uint64_t> parameterRevision{0};

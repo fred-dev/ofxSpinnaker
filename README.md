@@ -12,8 +12,17 @@ artifacts into the addon.
 ## Prerequisites
 
 - openFrameworks 0.12+ (tested with macOS makefiles)
-- macOS 11 or newer on an Intel (x86_64) host
-- Teledyne Spinnaker SDK 3.x for macOS (x86_64 download)
+- macOS 11 or newer, Apple Silicon (arm64) — matches the Spinnaker SDK builds
+  Teledyne currently ships for Mac (tested against SDK 4.4.0, arm64-native)
+- Teledyne Spinnaker SDK 4.x for macOS, installed once so the sync script has
+  something to copy from
+
+Nothing else needs to be installed system-wide. `libSpinnaker`/`libSpinUpdate`
+link against Homebrew's `libomp`/`libusb` by absolute path, but the sync script
+(below) pulls its own copies of those two from the SDK's bundled SpinView app
+and rewrites every synced dylib to reference them via `@rpath` instead, so the
+built app never depends on `/opt/homebrew`, `/usr/local`, or the SDK install
+itself still being present at runtime — only on what's synced into this addon.
 
 By default the Spinnaker installer places the SDK at `/Applications/Spinnaker`.
 If you chose a different location, adjust the paths below accordingly.
@@ -33,9 +42,17 @@ If you chose a different location, adjust the paths below accordingly.
 
    The script performs the following:
 
-   - Mirrors `include/` into `libs/spinnaker/include/`
+   - Mirrors `include/` into `libs/spinnaker/include/`, and patches two
+     Spinnaker headers whose bare `#include "Image.h"` would otherwise resolve
+     to openFrameworks' own ANGLE library instead of the SDK's
    - Copies `.dylib` artifacts into `libs/spinnaker/lib/osx/`
    - Copies the GenTL runtime into `libs/spinnaker/lib/osx/flir-gentl/`
+   - Creates toolchain-agnostic symlinks (e.g. `libGenApi.dylib`) for the
+     GenICam support libraries, so `addon_config.mk` doesn't need editing when
+     the SDK ships a build from a different clang version
+   - Bundles `libomp.dylib`/`libusb-1.0.0.dylib` in from the SDK's SpinView app,
+     and rewrites every synced dylib's ID and absolute Homebrew/`/usr/local`
+     dependency paths to `@rpath`, re-signing afterward
 
    The sync uses relative paths and assumes the SDK is under
    `/Applications/Spinnaker`, matching Teledyne's installer defaults.
@@ -56,8 +73,9 @@ make -j
 make RunRelease   # launches the example app
 ```
 
-The example automatically discovers connected Spinnaker cameras, exposes their
-parameter trees via `ofxGui`, and streams preview textures.
+The example automatically discovers connected Spinnaker cameras on startup,
+exposes their parameter trees via an `ofxImGui`-based control panel, and
+streams preview textures.
 
 ## Using the addon in your project
 

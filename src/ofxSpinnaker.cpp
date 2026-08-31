@@ -1,10 +1,9 @@
 #include "ofxSpinnaker.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
-#include <set>
 #include <stdexcept>
-#include <unordered_set>
 
 #include "ofFileUtils.h"
 #include "ofUtils.h"
@@ -14,13 +13,6 @@ using namespace Spinnaker::GenApi;
 using namespace Spinnaker::GenICam;
 
 namespace {
-constexpr uint64_t kImageTimeoutMs = 2000; // milliseconds
-
-std::string toLower(const std::string& value) {
-    std::string copy = value;
-    std::transform(copy.begin(), copy.end(), copy.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return copy;
-}
 
 std::string getStringNode(INodeMap& nodeMap, const std::string& nodeName) {
     try {
@@ -34,61 +26,26 @@ std::string getStringNode(INodeMap& nodeMap, const std::string& nodeName) {
     return {};
 }
 
-std::string classifySectionFromName(const std::string& name) {
-    const std::string lower = toLower(name);
-
-    if (lower.find("device") != std::string::npos ||
-        lower.find("information") != std::string::npos ||
-        lower.find("status") != std::string::npos ||
-        lower.find("diagnostic") != std::string::npos) {
-        return "info";
+// Spinnaker::System::GetInstance() loads its GenTL producer (.cti) itself -
+// this isn't an optional interop path, it's how the C++ API talks to the
+// transport layer at all. Point it at the copy addon_config.mk's ADDON_DATA
+// bundles into bin/data/flir-gentl/ rather than requiring it installed
+// system-wide, unless the caller has already set the variable themselves.
+void ensureGenTLEnvironmentConfigured() {
+    if (const char* existing = std::getenv("SPINNAKER_GENTL64_CTI"); existing && *existing) {
+        return;
     }
 
-    if (lower.find("exposure") != std::string::npos ||
-        lower.find("balance") != std::string::npos ||
-        lower.find("gamma") != std::string::npos ||
-        lower.find("gain") != std::string::npos ||
-        lower.find("black") != std::string::npos ||
-        lower.find("sharpness") != std::string::npos ||
-        lower.find("tone") != std::string::npos ||
-        lower.find("color") != std::string::npos) {
-        return "live";
+    const std::string ctiPath = ofToDataPath("flir-gentl/Spinnaker_GenTL.cti", true);
+    if (ofFile::doesFileExist(ctiPath)) {
+        setenv("SPINNAKER_GENTL64_CTI", ctiPath.c_str(), 1);
+    } else {
+        ofLogWarning("ofxSpinnaker") << "Bundled GenTL producer not found at " << ctiPath
+                                      << " - camera discovery will likely fail. Re-run"
+                                      << " scripts/sync_spinnaker_sdk.sh and rebuild.";
     }
-
-    if (lower.find("acquisition") != std::string::npos ||
-        lower.find("trigger") != std::string::npos ||
-        lower.find("sequencer") != std::string::npos ||
-        lower.find("gige") != std::string::npos ||
-        lower.find("stream") != std::string::npos ||
-        lower.find("imageformat") != std::string::npos ||
-        lower.find("lut") != std::string::npos ||
-        lower.find("transport") != std::string::npos) {
-        return "reconfigure";
-    }
-
-    return "advanced";
 }
 
-const std::unordered_set<std::string>& criticalNodeNames() {
-    static const std::unordered_set<std::string> critical = {
-        "pixelformat",
-        "width",
-        "height",
-        "offsetx",
-        "offsety",
-        "binninghorizontal",
-        "binningvertical",
-        "decimationhorizontal",
-        "decimationvertical",
-        "acquisitionmode",
-        "acquisitionframerateenable",
-        "acquisitionframerate",
-        "devicelinkthroughputlimit",
-        "reversex",
-        "reversey"
-    };
-    return critical;
-}
 } // namespace
 
 // --------------------------------------------------------------
@@ -109,6 +66,8 @@ bool ofxSpinnaker::setup(const std::string& configurationDirectoryPath) {
     }
 
     std::lock_guard<std::mutex> lock(cameraMutex);
+
+    ensureGenTLEnvironmentConfigured();
 
     try {
         system = System::GetInstance();
@@ -365,14 +324,41 @@ bool ofxSpinnakerCamera::setup() {
         configFilePath = ofFilePath::join(configDirectory, sanitized + ".json");
     }
 
+    // Lowest-latency buffering for a live-display use case, per the SDK's own
+    // guidance: always hand the app the newest frame rather than queuing stale
+    // ones. Must happen before the first BeginAcquisition().
+    configureStreamBuffering();
+
     buildParameterTree();
     attachParameterListener();
     loadConfiguration();
     parameterRevision.store(1, std::memory_order_relaxed);
     guiRefreshRequested.store(true, std::memory_order_release);
 
-    startThread();
+    try {
+        camera->RegisterEventHandler(*this);
+        imageEventHandlerRegistered = true;
+    } catch (const Spinnaker::Exception& e) {
+        ofLogError("ofxSpinnakerCamera") << "Failed to register image event handler on " << serialNumber << ": " << e.what();
+        return false;
+    }
+
     startStreaming();
+
+    if (streaming && !controlsClassified) {
+        // Now that the stream is actually running, discover which controls
+        // really require it to be stopped versus which stay writable live.
+        // This one-time probe replaces guessing from node names.
+        classifyControlGroups();
+        controlsClassified = true;
+
+        // Rebuild once so any control reclassified as "stop capture required"
+        // moves out of Live Controls into Reconfigure Controls before the GUI
+        // ever draws a frame.
+        skipConfigReload = true;
+        rebuildParameters();
+        skipConfigReload = false;
+    }
 
     ofLogNotice("ofxSpinnakerCamera") << "Camera " << serialNumber << " initialized."
                                        << " Device: " << deviceDisplayName;
@@ -382,7 +368,15 @@ bool ofxSpinnakerCamera::setup() {
 
 void ofxSpinnakerCamera::shutdown() {
     stopStreaming();
-    waitForThread(true);
+
+    if (imageEventHandlerRegistered && camera && camera->IsValid()) {
+        try {
+            camera->UnregisterEventHandler(*this);
+        } catch (const Spinnaker::Exception& e) {
+            ofLogWarning("ofxSpinnakerCamera") << "Failed to unregister image event handler on " << serialNumber << ": " << e.what();
+        }
+        imageEventHandlerRegistered = false;
+    }
 
     if (listenerAttached) {
         parameterListener.unsubscribe();
@@ -390,6 +384,7 @@ void ofxSpinnakerCamera::shutdown() {
     }
 
     if (camera && camera->IsValid()) {
+        resetGevHeartbeatIfPresent();
         try {
             camera->DeInit();
         } catch (const Spinnaker::Exception& e) {
@@ -438,6 +433,16 @@ bool ofxSpinnakerCamera::isStreaming() const {
 }
 
 void ofxSpinnakerCamera::update() {
+    if (pendingRebuildRequested) {
+        // Deferred from onParameterChanged(): rebuilding the ofParameterGroup
+        // tree here (main thread, between frames) rather than inline from the
+        // parameter-changed callback avoids invalidating a GUI's live iteration
+        // over the same group (e.g. an ImGui widget triggering a structural
+        // rebuild mid-draw).
+        pendingRebuildRequested = false;
+        rebuildParameters();
+    }
+
     {
         std::unique_lock<std::mutex> lock(frameMutex);
         if (newFrameAvailable) {
@@ -497,6 +502,39 @@ uint64_t ofxSpinnakerCamera::getParameterRevision() const {
 
 bool ofxSpinnakerCamera::consumeGuiRefreshFlag() {
     return guiRefreshRequested.exchange(false, std::memory_order_acq_rel);
+}
+
+bool ofxSpinnakerCamera::isParameterCurrentlyWritable(const ofAbstractParameter& parameter) const {
+    const ofAbstractParameter* parameterPtr = &parameter;
+    auto pathIt = parameterPaths.find(parameterPtr);
+    if (pathIt == parameterPaths.end()) {
+        return false;
+    }
+
+    auto nodeIt = writableNodes.find(pathIt->second);
+    if (nodeIt == writableNodes.end() || !nodeIt->second) {
+        return false;
+    }
+
+    try {
+        return IsWritable(nodeIt->second) && IsAvailable(nodeIt->second);
+    } catch (const Spinnaker::Exception&) {
+        return false;
+    }
+}
+
+const std::vector<std::string>* ofxSpinnakerCamera::getEnumEntryNames(const ofAbstractParameter& parameter) const {
+    auto pathIt = parameterPaths.find(&parameter);
+    if (pathIt == parameterPaths.end()) {
+        return nullptr;
+    }
+
+    auto namesIt = enumDisplayNames.find(pathIt->second);
+    if (namesIt == enumDisplayNames.end()) {
+        return nullptr;
+    }
+
+    return &namesIt->second;
 }
 
 void ofxSpinnakerCamera::setConfigurationDirectory(const std::string& directory) {
@@ -578,7 +616,7 @@ void ofxSpinnakerCamera::loadConfiguration() {
 
         if (json.contains("parameters") && json["parameters"].is_object()) {
             loadingConfiguration = true;
-            applyConfigurationToGroup(rootParameters, "", json["parameters"]);
+            applyAllParametersFromJson(json["parameters"]);
             loadingConfiguration = false;
         }
 
@@ -606,7 +644,7 @@ void ofxSpinnakerCamera::saveConfiguration() {
         cachedConfiguration["device"]["model"] = deviceDisplayName;
         cachedConfiguration["device"]["timestamp"] = ofGetTimestampString();
         cachedConfiguration["parameters"] = ofJson::object();
-        collectParameters(rootParameters, "", cachedConfiguration["parameters"]);
+        collectAllParameters(cachedConfiguration["parameters"]);
     }
 
     if (configFilePath.empty()) {
@@ -643,7 +681,7 @@ ofJson ofxSpinnakerCamera::captureConfigurationSnapshot() const {
     json["device"]["timestamp"] = ofGetTimestampString();
 
     ofJson params = ofJson::object();
-    collectParameters(rootParameters, "", params);
+    collectAllParameters(params);
     json["parameters"] = params;
 
     return json;
@@ -753,41 +791,112 @@ void ofxSpinnakerCamera::markConfigurationDirty() {
     configDirty.store(true, std::memory_order_release);
 }
 
-void ofxSpinnakerCamera::threadedFunction() {
-    while (isThreadRunning()) {
-        if (!streaming) {
-            ofSleepMillis(10);
+void ofxSpinnakerCamera::collectAllParameters(ofJson& collection) const {
+    collectParameters(liveParameters, "", collection);
+    collectParameters(reconfigureParameters, "", collection);
+}
+
+void ofxSpinnakerCamera::applyAllParametersFromJson(const ofJson& values) {
+    applyConfigurationToGroup(liveParameters, "", values);
+    applyConfigurationToGroup(reconfigureParameters, "", values);
+}
+
+void ofxSpinnakerCamera::configureStreamBuffering() {
+    if (!camera || !camera->IsValid()) {
+        return;
+    }
+
+    try {
+        INodeMap& streamNodeMap = camera->GetTLStreamNodeMap();
+
+        CEnumerationPtr handlingMode = streamNodeMap.GetNode("StreamBufferHandlingMode");
+        if (IsReadable(handlingMode) && IsWritable(handlingMode)) {
+            CEnumEntryPtr newestOnly = handlingMode->GetEntryByName("NewestOnly");
+            if (IsReadable(newestOnly)) {
+                handlingMode->SetIntValue(newestOnly->GetValue());
+            }
+        }
+
+        CEnumerationPtr countMode = streamNodeMap.GetNode("StreamBufferCountMode");
+        if (IsReadable(countMode) && IsWritable(countMode)) {
+            CEnumEntryPtr manual = countMode->GetEntryByName("Manual");
+            if (IsReadable(manual)) {
+                countMode->SetIntValue(manual->GetValue());
+            }
+        }
+
+        CIntegerPtr bufferCount = streamNodeMap.GetNode("StreamBufferCountManual");
+        if (IsReadable(bufferCount) && IsWritable(bufferCount)) {
+            int64_t desired = 3;
+            desired = std::max<int64_t>(bufferCount->GetMin(), std::min<int64_t>(desired, bufferCount->GetMax()));
+            bufferCount->SetValue(desired);
+        }
+    } catch (const Spinnaker::Exception& e) {
+        ofLogWarning("ofxSpinnakerCamera") << "Failed to configure stream buffering for " << serialNumber << ": " << e.what();
+    }
+}
+
+void ofxSpinnakerCamera::resetGevHeartbeatIfPresent() {
+    if (!camera || !camera->IsValid()) {
+        return;
+    }
+
+    try {
+        INodeMap& nodeMap = camera->GetNodeMap();
+        CBooleanPtr heartbeatDisable = nodeMap.GetNode("GevGVCPHeartbeatDisable");
+        if (IsReadable(heartbeatDisable) && IsWritable(heartbeatDisable) && heartbeatDisable->GetValue()) {
+            heartbeatDisable->SetValue(false);
+        }
+    } catch (const Spinnaker::Exception& e) {
+        ofLogWarning("ofxSpinnakerCamera") << "Failed to reset GVCP heartbeat for " << serialNumber << ": " << e.what();
+    }
+}
+
+void ofxSpinnakerCamera::classifyControlGroups() {
+    for (auto& entry : preStreamWritableSnapshot) {
+        const std::string& path = entry.first;
+        const bool wasWritable = entry.second;
+
+        auto nodeIt = writableNodes.find(path);
+        if (nodeIt == writableNodes.end() || !nodeIt->second) {
             continue;
         }
 
+        bool nowWritable = false;
         try {
-            ImagePtr nextImage = camera->GetNextImage(kImageTimeoutMs);
-
-            if (!nextImage || nextImage->IsIncomplete()) {
-                if (nextImage && nextImage->IsIncomplete()) {
-                    ofLogWarning("ofxSpinnakerCamera") << "Incomplete image on " << serialNumber
-                                                       << " - status " << nextImage->GetImageStatus();
-                }
-                continue;
-            }
-
-            ImagePtr converted = processor.Convert(nextImage, PixelFormat_RGB8);
-
-            std::unique_lock<std::mutex> lock(frameMutex);
-            pixels.setFromPixels(static_cast<unsigned char*>(converted->GetData()),
-                                 converted->GetWidth(),
-                                 converted->GetHeight(),
-                                 OF_IMAGE_COLOR);
-            newFrameAvailable = true;
-            lock.unlock();
-
-            nextImage->Release();
-        } catch (const Spinnaker::Exception& e) {
-            if (streaming) {
-                ofLogWarning("ofxSpinnakerCamera") << "Image acquisition error on " << serialNumber << ": " << e.what();
-            }
-            ofSleepMillis(5);
+            nowWritable = IsWritable(nodeIt->second);
+        } catch (const Spinnaker::Exception&) {
+            nowWritable = false;
         }
+
+        if (wasWritable && !nowWritable) {
+            nodeClassification[path] = ofxSpinnakerControlClass::StopCaptureRequired;
+        } else {
+            nodeClassification[path] = ofxSpinnakerControlClass::RealTime;
+        }
+    }
+}
+
+void ofxSpinnakerCamera::OnImageEvent(Spinnaker::ImagePtr image) {
+    if (!image || image->IsIncomplete()) {
+        if (image && image->IsIncomplete()) {
+            ofLogWarning("ofxSpinnakerCamera") << "Incomplete image on " << serialNumber
+                                               << " - status " << image->GetImageStatus();
+        }
+        return;
+    }
+
+    try {
+        ImagePtr converted = processor.Convert(image, PixelFormat_RGB8);
+
+        std::unique_lock<std::mutex> lock(frameMutex);
+        pixels.setFromPixels(static_cast<unsigned char*>(converted->GetData()),
+                             converted->GetWidth(),
+                             converted->GetHeight(),
+                             OF_IMAGE_COLOR);
+        newFrameAvailable = true;
+    } catch (const Spinnaker::Exception& e) {
+        ofLogWarning("ofxSpinnakerCamera") << "Image conversion error on " << serialNumber << ": " << e.what();
     }
 }
 
@@ -800,7 +909,6 @@ void ofxSpinnakerCamera::buildParameterTree() {
     infoParameters.clear();
     liveParameters.clear();
     reconfigureParameters.clear();
-    advancedParameters.clear();
     writableNodes.clear();
     enumDisplayNames.clear();
     enumValueMaps.clear();
@@ -811,12 +919,10 @@ void ofxSpinnakerCamera::buildParameterTree() {
     infoParameters.setName("Info");
     liveParameters.setName("Live Controls");
     reconfigureParameters.setName("Reconfigure Controls");
-    advancedParameters.setName("Advanced Controls");
 
     rootParameters.add(infoParameters);
     rootParameters.add(liveParameters);
     rootParameters.add(reconfigureParameters);
-    rootParameters.add(advancedParameters);
 
     try {
         buildInfoGroup(camera->GetTLDeviceNodeMap());
@@ -837,23 +943,9 @@ void ofxSpinnakerCamera::buildParameterTree() {
         rootCategory->GetFeatures(features);
 
         for (auto& feature : features) {
-            if (!feature) {
-                continue;
+            if (feature) {
+                traverseNode(feature, liveParameters, reconfigureParameters, "");
             }
-            const std::string section = classifySectionFromName(feature->GetName().c_str());
-            ofParameterGroup* target = nullptr;
-            if (section == "info") {
-                target = &infoParameters;
-            } else if (section == "live") {
-                target = &liveParameters;
-            } else if (section == "reconfigure") {
-                target = &reconfigureParameters;
-            } else {
-                target = &advancedParameters;
-            }
-
-            std::string basePath = target ? target->getName() : section;
-            traverseNode(feature, *target, section, 0, basePath);
         }
     } catch (const Spinnaker::Exception& e) {
         ofLogError("ofxSpinnakerCamera") << "Failed to traverse node map: " << e.what();
@@ -862,7 +954,7 @@ void ofxSpinnakerCamera::buildParameterTree() {
 
 void ofxSpinnakerCamera::buildInfoGroup(INodeMap& nodeMap) {
     infoParameters.clear();
-    infoParameters.setName("Camera Info");
+    infoParameters.setName("Info");
 
     const std::vector<std::pair<std::string, std::string>> infoNodes = {
         {"Vendor", getStringNode(nodeMap, "DeviceVendorName")},
@@ -883,11 +975,14 @@ void ofxSpinnakerCamera::buildInfoGroup(INodeMap& nodeMap) {
 }
 
 void ofxSpinnakerCamera::traverseNode(NodePtr node,
-                                      ofParameterGroup& container,
-                                      const std::string& sectionName,
-                                      unsigned int depth,
+                                      ofParameterGroup& liveContainer,
+                                      ofParameterGroup& reconfigureContainer,
                                       const std::string& currentPath) {
-    if (!node || !IsReadable(node)) {
+    if (!node || !IsReadable(node) || !IsAvailable(node)) {
+        return;
+    }
+
+    if (node->GetVisibility() == Spinnaker::GenApi::Invisible) {
         return;
     }
 
@@ -902,26 +997,32 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
         FeatureList_t features;
         category->GetFeatures(features);
 
-        ofParameterGroup subgroup;
-        subgroup.setName(category->GetDisplayName().c_str());
+        ofParameterGroup liveSubgroup;
+        ofParameterGroup reconfigureSubgroup;
+        const std::string name = category->GetDisplayName().c_str();
+        liveSubgroup.setName(name);
+        reconfigureSubgroup.setName(name);
 
-        const std::string subgroupPath = currentPath.empty()
-                                             ? subgroup.getName()
-                                             : currentPath + "/" + subgroup.getName();
+        const std::string subgroupPath = currentPath.empty() ? name : currentPath + "/" + name;
 
         for (auto& feature : features) {
             if (feature) {
-                traverseNode(feature, subgroup, sectionName, depth + 1, subgroupPath);
+                traverseNode(feature, liveSubgroup, reconfigureSubgroup, subgroupPath);
             }
         }
 
-        if (subgroup.size() > 0) {
-            container.add(subgroup);
+        if (liveSubgroup.size() > 0) {
+            liveContainer.add(liveSubgroup);
+        }
+        if (reconfigureSubgroup.size() > 0) {
+            reconfigureContainer.add(reconfigureSubgroup);
         }
         return;
     }
 
-    if (!IsWritable(node)) {
+    if (interfaceType == intfICommand) {
+        // Action nodes (TriggerSoftware, UserSetSave, ...) aren't exposed as
+        // bindable parameters.
         return;
     }
 
@@ -933,6 +1034,33 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
     if (node->IsSelector()) {
         selectorParameterPaths.insert(parameterPath);
     }
+
+    bool writableNow = false;
+    try {
+        writableNow = IsWritable(node);
+    } catch (const Spinnaker::Exception&) {
+        writableNow = false;
+    }
+
+    if (!controlsClassified) {
+        // Baseline snapshot for the one-time pre/post-stream classification
+        // probe in classifyControlGroups(). Nodes that are only non-writable
+        // because an Auto mode currently governs them (e.g. ExposureTime while
+        // ExposureAuto != Off) are still exposed here and land in Live Controls
+        // by default; their live enabled/disabled state is handled separately
+        // by isParameterCurrentlyWritable().
+        preStreamWritableSnapshot[parameterPath] = writableNow;
+    }
+
+    ofxSpinnakerControlClass controlClass = ofxSpinnakerControlClass::RealTime;
+    auto classIt = nodeClassification.find(parameterPath);
+    if (classIt != nodeClassification.end()) {
+        controlClass = classIt->second;
+    }
+
+    ofParameterGroup& container = (controlClass == ofxSpinnakerControlClass::StopCaptureRequired)
+                                       ? reconfigureContainer
+                                       : liveContainer;
 
     try {
         switch (interfaceType) {
@@ -1122,6 +1250,11 @@ void ofxSpinnakerCamera::onParameterChanged(ofAbstractParameter& parameter) {
     }
 }
 
+bool ofxSpinnakerCamera::isStopCaptureRequired(const std::string& path) const {
+    auto it = nodeClassification.find(path);
+    return it != nodeClassification.end() && it->second == ofxSpinnakerControlClass::StopCaptureRequired;
+}
+
 bool ofxSpinnakerCamera::applyEnumeration(const std::string& path, NodePtr node, ofParameter<int>& parameter) {
     CEnumerationPtr enumeration = static_cast<CEnumerationPtr>(node);
     if (!enumeration) {
@@ -1143,8 +1276,7 @@ bool ofxSpinnakerCamera::applyEnumeration(const std::string& path, NodePtr node,
         enumeration->SetIntValue(valueIt->second);
     };
 
-    const std::string name = parameter.getName();
-    if (isCriticalNode(name)) {
+    if (isStopCaptureRequired(path)) {
         stopAcquisitionForCriticalChange(setter);
     } else {
         setter();
@@ -1152,10 +1284,8 @@ bool ofxSpinnakerCamera::applyEnumeration(const std::string& path, NodePtr node,
 
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
-    if (selectorParameterPaths.count(path) > 0 || isCriticalNode(name)) {
-        skipConfigReload = true;
-        rebuildParameters();
-        skipConfigReload = false;
+    if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
+        pendingRebuildRequested = true;
     }
     return true;
 }
@@ -1170,8 +1300,7 @@ bool ofxSpinnakerCamera::applyFloat(const std::string& path, NodePtr node, ofPar
         floatNode->SetValue(parameter.get());
     };
 
-    const std::string name = parameter.getName();
-    if (isCriticalNode(name)) {
+    if (isStopCaptureRequired(path)) {
         stopAcquisitionForCriticalChange(setter);
     } else {
         setter();
@@ -1179,10 +1308,8 @@ bool ofxSpinnakerCamera::applyFloat(const std::string& path, NodePtr node, ofPar
 
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
-    if (selectorParameterPaths.count(path) > 0 || isCriticalNode(name)) {
-        skipConfigReload = true;
-        rebuildParameters();
-        skipConfigReload = false;
+    if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
+        pendingRebuildRequested = true;
     }
     return true;
 }
@@ -1197,8 +1324,7 @@ bool ofxSpinnakerCamera::applyInteger(const std::string& path, NodePtr node, ofP
         intNode->SetValue(parameter.get());
     };
 
-    const std::string name = parameter.getName();
-    if (isCriticalNode(name)) {
+    if (isStopCaptureRequired(path)) {
         stopAcquisitionForCriticalChange(setter);
     } else {
         setter();
@@ -1206,10 +1332,8 @@ bool ofxSpinnakerCamera::applyInteger(const std::string& path, NodePtr node, ofP
 
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
-    if (selectorParameterPaths.count(path) > 0 || isCriticalNode(name)) {
-        skipConfigReload = true;
-        rebuildParameters();
-        skipConfigReload = false;
+    if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
+        pendingRebuildRequested = true;
     }
     return true;
 }
@@ -1224,8 +1348,7 @@ bool ofxSpinnakerCamera::applyBoolean(const std::string& path, NodePtr node, ofP
         boolNode->SetValue(parameter.get());
     };
 
-    const std::string name = parameter.getName();
-    if (isCriticalNode(name)) {
+    if (isStopCaptureRequired(path)) {
         stopAcquisitionForCriticalChange(setter);
     } else {
         setter();
@@ -1233,10 +1356,8 @@ bool ofxSpinnakerCamera::applyBoolean(const std::string& path, NodePtr node, ofP
 
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << (parameter.get() ? "true" : "false");
 
-    if (selectorParameterPaths.count(path) > 0 || isCriticalNode(name)) {
-        skipConfigReload = true;
-        rebuildParameters();
-        skipConfigReload = false;
+    if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
+        pendingRebuildRequested = true;
     }
     return true;
 }
@@ -1251,8 +1372,7 @@ bool ofxSpinnakerCamera::applyString(const std::string& path, NodePtr node, ofPa
         stringNode->SetValue(parameter.get().c_str());
     };
 
-    const std::string name = parameter.getName();
-    if (isCriticalNode(name)) {
+    if (isStopCaptureRequired(path)) {
         stopAcquisitionForCriticalChange(setter);
     } else {
         setter();
@@ -1260,10 +1380,8 @@ bool ofxSpinnakerCamera::applyString(const std::string& path, NodePtr node, ofPa
 
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
-    if (selectorParameterPaths.count(path) > 0 || isCriticalNode(name)) {
-        skipConfigReload = true;
-        rebuildParameters();
-        skipConfigReload = false;
+    if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
+        pendingRebuildRequested = true;
     }
     return true;
 }
@@ -1314,7 +1432,7 @@ void ofxSpinnakerCamera::rebuildParameters() {
 
     if (configLoaded && !skipConfigReload && !cachedConfiguration.is_null() && cachedConfiguration.contains("parameters")) {
         loadingConfiguration = true;
-        applyConfigurationToGroup(rootParameters, "", cachedConfiguration["parameters"]);
+        applyAllParametersFromJson(cachedConfiguration["parameters"]);
         loadingConfiguration = false;
     }
 
@@ -1329,23 +1447,17 @@ void ofxSpinnakerCamera::stopAcquisitionForCriticalChange(const std::function<vo
 
     if (restart) {
         ofLogNotice("ofxSpinnakerCamera") << "Temporarily stopping acquisition on " << serialNumber
-                                           << " for critical parameter change.";
+                                           << " for a control that requires the stream to be stopped.";
         stopStreaming();
     }
 
     try {
         fn();
     } catch (const Spinnaker::Exception& e) {
-        ofLogError("ofxSpinnakerCamera") << "Critical parameter update failed: " << e.what();
+        ofLogError("ofxSpinnakerCamera") << "Parameter update requiring stopped capture failed: " << e.what();
     }
 
     if (restart) {
         startStreaming();
     }
 }
-
-bool ofxSpinnakerCamera::isCriticalNode(const std::string& nodeName) const {
-    const std::string lower = toLower(nodeName);
-    return criticalNodeNames().count(lower) > 0;
-}
-
