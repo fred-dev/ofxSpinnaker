@@ -112,6 +112,7 @@ private:
     void classifyControlGroups();
     void attachParameterListener();
     void rebuildParameters();
+    void requestDeferredRebuild();
 
     void onParameterChanged(ofAbstractParameter& parameter);
     bool applyEnumeration(const std::string& path, NodePtr node, ofParameter<int>& parameter);
@@ -162,6 +163,11 @@ private:
     bool newFrameAvailable = false;
     bool streaming = false;
 
+    // Only ever touched from OnImageEvent (Spinnaker's own acquisition
+    // thread, called serially), so these don't need frameMutex.
+    uint64_t lastIncompleteImageLogTime = 0;
+    uint32_t incompleteImageCount = 0;
+
     ofParameterGroup rootParameters;
     ofParameterGroup liveParameters;
     ofParameterGroup reconfigureParameters;
@@ -185,6 +191,11 @@ private:
     bool listenerAttached = false;
     bool rebuildingParameters = false;
     bool pendingRebuildRequested = false;
+    // Set alongside pendingRebuildRequested when the request happens while
+    // restoring a saved configuration: the value that triggered the rebuild
+    // was itself just set FROM that configuration, so the deferred rebuild
+    // doesn't need to reapply it all over again.
+    bool pendingRebuildSkipConfigReload = false;
     bool loadingConfiguration = false;
     bool skipConfigReload = false;
     std::atomic<uint64_t> parameterRevision{0};

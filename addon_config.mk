@@ -44,21 +44,17 @@ osx:
     # ADDON_COPY_TO_BIN directive in this build system (an earlier version of
     # this file had one; it was silently inert). So the real control over what
     # gets linked and bundled is scripts/sync_spinnaker_sdk.sh's rsync
-    # allowlist, not the ADDON_LIBS list below - these entries exist mainly as
-    # documentation of the addon's actual dependency closure (Spinnaker's own
-    # runtime plus the GenICam support libraries), deliberately excluding
+    # allowlist, not an ADDON_LIBS list - deliberately excluding
     # SpinVideo/SpinVideo_C (unused, pulls in a full ffmpeg chain) and the
     # bundled CppUnit/GCBaseTest test-only libraries.
-    ADDON_LIBS += Spinnaker
-    ADDON_LIBS += Spinnaker_C
-    ADDON_LIBS += SpinUpdate
-    ADDON_LIBS += GenApi
-    ADDON_LIBS += GCBase
-    ADDON_LIBS += NodeMapData
-    ADDON_LIBS += MathParser
-    ADDON_LIBS += XmlParser
-    ADDON_LIBS += log4cpp
-    ADDON_LIBS += Log
+    #
+    # Deliberately NOT listing the individual libs (Spinnaker, GenApi, GCBase,
+    # ...) here as bare ADDON_LIBS entries: unlike the make build, the Xcode
+    # project generator takes each entry literally and emits it straight into
+    # OTHER_LDFLAGS (e.g. "../Spinnaker" instead of "-lSpinnaker" or a real
+    # dylib path), which clang then fails to find as a file - breaking the
+    # Xcode build while the make build stayed fine, since it already links
+    # every auto-discovered dylib directly by its real (versioned) path.
 
     # Spinnaker's System::GetInstance() loads its GenTL producer (.cti) itself -
     # it's not just an optional interop path - so the driver bundle has to ship

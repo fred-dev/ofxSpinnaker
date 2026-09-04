@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 #include "ofFileUtils.h"
@@ -31,9 +32,22 @@ std::string getStringNode(INodeMap& nodeMap, const std::string& nodeName) {
 // transport layer at all. Point it at the copy addon_config.mk's ADDON_DATA
 // bundles into bin/data/flir-gentl/ rather than requiring it installed
 // system-wide, unless the caller has already set the variable themselves.
+//
+// The existing value is only trusted if it actually resolves: a launcher
+// that doesn't source the same shell rc files as a manual terminal run
+// (an IDE's build/debug task, a login item, etc.) can still inherit a
+// stale SPINNAKER_GENTL64_CTI from elsewhere in the process tree, and an
+// unresolved path there would otherwise silently shadow this fallback and
+// break System::GetInstance() with no clear reason why it works manually
+// but not from the IDE.
 void ensureGenTLEnvironmentConfigured() {
     if (const char* existing = std::getenv("SPINNAKER_GENTL64_CTI"); existing && *existing) {
-        return;
+        if (ofFile::doesFileExist(existing)) {
+            return;
+        }
+        ofLogWarning("ofxSpinnaker") << "SPINNAKER_GENTL64_CTI is set to '" << existing
+                                      << "' but that file doesn't exist - ignoring it and"
+                                      << " falling back to the bundled GenTL producer instead.";
     }
 
     const std::string ctiPath = ofToDataPath("flir-gentl/Spinnaker_GenTL.cti", true);
@@ -440,7 +454,20 @@ void ofxSpinnakerCamera::update() {
         // over the same group (e.g. an ImGui widget triggering a structural
         // rebuild mid-draw).
         pendingRebuildRequested = false;
-        rebuildParameters();
+
+        if (pendingRebuildSkipConfigReload) {
+            // The value that triggered this rebuild was itself just restored
+            // from the saved configuration (see requestDeferredRebuild()) -
+            // reapplying the whole config again here would just repeat the
+            // same writes (and any of their "not writable"/out-of-range
+            // warnings) a second time for no benefit.
+            pendingRebuildSkipConfigReload = false;
+            skipConfigReload = true;
+            rebuildParameters();
+            skipConfigReload = false;
+        } else {
+            rebuildParameters();
+        }
     }
 
     {
@@ -797,8 +824,24 @@ void ofxSpinnakerCamera::collectAllParameters(ofJson& collection) const {
 }
 
 void ofxSpinnakerCamera::applyAllParametersFromJson(const ofJson& values) {
+    // Restoring a saved configuration can touch several controls that each
+    // individually require the stream to be stopped (PixelFormat, Width,
+    // Height, binning, ...). Applying them one at a time would stop and
+    // restart acquisition once per field; stop once for the whole batch
+    // instead. Each individual applyXxx()'s stopAcquisitionForCriticalChange()
+    // call checks isStreaming() itself, so once we've stopped it here those
+    // calls just apply directly rather than each trying to restart in turn.
+    const bool wasStreaming = isStreaming();
+    if (wasStreaming) {
+        stopStreaming();
+    }
+
     applyConfigurationToGroup(liveParameters, "", values);
     applyConfigurationToGroup(reconfigureParameters, "", values);
+
+    if (wasStreaming) {
+        startStreaming();
+    }
 }
 
 void ofxSpinnakerCamera::configureStreamBuffering() {
@@ -880,8 +923,22 @@ void ofxSpinnakerCamera::classifyControlGroups() {
 void ofxSpinnakerCamera::OnImageEvent(Spinnaker::ImagePtr image) {
     if (!image || image->IsIncomplete()) {
         if (image && image->IsIncomplete()) {
-            ofLogWarning("ofxSpinnakerCamera") << "Incomplete image on " << serialNumber
-                                               << " - status " << image->GetImageStatus();
+            // This callback runs on Spinnaker's own acquisition thread, once
+            // per frame. Under sustained packet loss (a network issue, not a
+            // code bug - see GevSCPD/adapter/cable troubleshooting) this can
+            // fire at full frame rate; logging every single one adds real
+            // console-I/O overhead right on the acquisition hot path and
+            // makes the whole app feel sluggish on top of the dropped frames
+            // themselves. Throttle to at most once per second.
+            ++incompleteImageCount;
+            const uint64_t now = ofGetElapsedTimeMillis();
+            if (now - lastIncompleteImageLogTime > 1000) {
+                ofLogWarning("ofxSpinnakerCamera") << "Incomplete image on " << serialNumber
+                                                   << " - status " << image->GetImageStatus()
+                                                   << " (" << incompleteImageCount << " incomplete since last log)";
+                lastIncompleteImageLogTime = now;
+                incompleteImageCount = 0;
+            }
         }
         return;
     }
@@ -1137,11 +1194,23 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                     return;
                 }
 
+                // ofParameter<int> is a 32-bit signed int, but GenICam integer
+                // nodes are 64-bit - some (IP-address/register-style fields
+                // like GevSCDA) legitimately use the full unsigned 32-bit
+                // range or beyond. Narrowing that without clamping first
+                // silently overflows into a garbage (often negative) min/max,
+                // which is exactly what previously slipped through and made
+                // an ImGui slider try to render with out-of-range bounds.
+                constexpr int64_t kInt32Min = static_cast<int64_t>(std::numeric_limits<int>::min());
+                constexpr int64_t kInt32Max = static_cast<int64_t>(std::numeric_limits<int>::max());
+                const int clampedMin = static_cast<int>(std::clamp(intNode->GetMin(), kInt32Min, kInt32Max));
+                const int clampedMax = static_cast<int>(std::clamp(intNode->GetMax(), kInt32Min, kInt32Max));
+                const int clampedValue = static_cast<int>(std::clamp(intNode->GetValue(),
+                                                                       static_cast<int64_t>(clampedMin),
+                                                                       static_cast<int64_t>(clampedMax)));
+
                 ofParameter<int> parameter;
-                parameter.set(displayName,
-                              static_cast<int>(intNode->GetValue()),
-                              static_cast<int>(intNode->GetMin()),
-                              static_cast<int>(intNode->GetMax()));
+                parameter.set(displayName, clampedValue, clampedMin, clampedMax);
                 container.add(parameter);
                 ofParameter<int>& stored = container.get<int>(displayName);
                 parameterPaths[&stored] = parameterPath;
@@ -1203,6 +1272,28 @@ void ofxSpinnakerCamera::onParameterChanged(ofAbstractParameter& parameter) {
         return;
     }
 
+    // Parameters are now exposed even when currently non-writable (so an
+    // Auto-governed control like ExposureTime still shows up, just disabled,
+    // rather than vanishing from the tree) - but that means a saved config
+    // can legitimately reference a control that isn't writable right now
+    // (Auto still on) or ever (a read-only GEV/transport-layer status field).
+    // Check first instead of attempting SetValue() and catching the
+    // exception: it's cheap, and avoids treating an entirely expected
+    // situation as a warning-worthy failure. An interactive GUI edit
+    // shouldn't reach here at all for a non-writable control (widgets should
+    // be disabled via isParameterCurrentlyWritable()), so still warn in that
+    // case - it points at a real GUI bug rather than a stale config value.
+    if (!IsWritable(node)) {
+        if (loadingConfiguration) {
+            ofLogVerbose("ofxSpinnakerCamera") << "Skipping non-writable parameter '" << parameter.getName()
+                                                << "' while restoring configuration.";
+        } else {
+            ofLogWarning("ofxSpinnakerCamera") << "Ignoring edit to '" << parameter.getName()
+                                                << "': node is not currently writable.";
+        }
+        return;
+    }
+
     bool success = false;
 
     try {
@@ -1255,6 +1346,13 @@ bool ofxSpinnakerCamera::isStopCaptureRequired(const std::string& path) const {
     return it != nodeClassification.end() && it->second == ofxSpinnakerControlClass::StopCaptureRequired;
 }
 
+void ofxSpinnakerCamera::requestDeferredRebuild() {
+    pendingRebuildRequested = true;
+    if (loadingConfiguration) {
+        pendingRebuildSkipConfigReload = true;
+    }
+}
+
 bool ofxSpinnakerCamera::applyEnumeration(const std::string& path, NodePtr node, ofParameter<int>& parameter) {
     CEnumerationPtr enumeration = static_cast<CEnumerationPtr>(node);
     if (!enumeration) {
@@ -1285,7 +1383,7 @@ bool ofxSpinnakerCamera::applyEnumeration(const std::string& path, NodePtr node,
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
     if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
-        pendingRebuildRequested = true;
+        requestDeferredRebuild();
     }
     return true;
 }
@@ -1309,7 +1407,7 @@ bool ofxSpinnakerCamera::applyFloat(const std::string& path, NodePtr node, ofPar
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
     if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
-        pendingRebuildRequested = true;
+        requestDeferredRebuild();
     }
     return true;
 }
@@ -1333,7 +1431,7 @@ bool ofxSpinnakerCamera::applyInteger(const std::string& path, NodePtr node, ofP
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
     if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
-        pendingRebuildRequested = true;
+        requestDeferredRebuild();
     }
     return true;
 }
@@ -1357,7 +1455,7 @@ bool ofxSpinnakerCamera::applyBoolean(const std::string& path, NodePtr node, ofP
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << (parameter.get() ? "true" : "false");
 
     if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
-        pendingRebuildRequested = true;
+        requestDeferredRebuild();
     }
     return true;
 }
@@ -1381,7 +1479,7 @@ bool ofxSpinnakerCamera::applyString(const std::string& path, NodePtr node, ofPa
     ofLogNotice("ofxSpinnakerCamera") << path << " -> " << parameter.get();
 
     if (selectorParameterPaths.count(path) > 0 || isStopCaptureRequired(path)) {
-        pendingRebuildRequested = true;
+        requestDeferredRebuild();
     }
     return true;
 }
