@@ -295,6 +295,9 @@ void ofxSpinnaker::discoverCameras() {
 ofxSpinnakerCamera::ofxSpinnakerCamera(Spinnaker::CameraPtr cameraPtr)
 : camera(std::move(cameraPtr)) {
     processor.SetColorProcessing(SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR);
+    // Always exactly one entry so getTexturePlanes()/getTexture() have a
+    // valid reference even before the first frame arrives.
+    texturePlanes.resize(1);
 }
 
 ofxSpinnakerCamera::~ofxSpinnakerCamera() {
@@ -377,10 +380,12 @@ bool ofxSpinnakerCamera::setup() {
     ofLogNotice("ofxSpinnakerCamera") << "Camera " << serialNumber << " initialized."
                                        << " Device: " << deviceDisplayName;
 
+    initializedFlag = true;
     return true;
 }
 
 void ofxSpinnakerCamera::shutdown() {
+    initializedFlag = false;
     stopStreaming();
 
     if (imageEventHandlerRegistered && camera && camera->IsValid()) {
@@ -470,12 +475,20 @@ void ofxSpinnakerCamera::update() {
         }
     }
 
+    // isFrameNew() (ofBaseVideo contract) is true for exactly one update()
+    // call following a newly-arrived frame, matching ofVideoGrabber's own
+    // semantics - reset here, set below only if a frame was actually consumed.
+    frameIsNew = false;
+
     {
         std::unique_lock<std::mutex> lock(frameMutex);
         if (newFrameAvailable) {
-            ensureTextureMatches(pixels);
-            texture.loadData(pixels);
+            if (useTexture) {
+                ensureTextureMatches(pixels);
+                texturePlanes[0].loadData(pixels);
+            }
             newFrameAvailable = false;
+            frameIsNew = true;
         }
     }
 
@@ -485,26 +498,114 @@ void ofxSpinnakerCamera::update() {
             saveConfiguration();
         }
     }
+
+    updateMeasuredFps();
 }
 
 void ofxSpinnakerCamera::draw(float x, float y) const {
-    if (texture.isAllocated()) {
-        texture.draw(x, y);
+    if (texturePlanes[0].isAllocated()) {
+        texturePlanes[0].draw(x, y);
     }
 }
 
 void ofxSpinnakerCamera::draw(float x, float y, float width, float height) const {
-    if (texture.isAllocated()) {
-        texture.draw(x, y, width, height);
+    if (texturePlanes[0].isAllocated()) {
+        texturePlanes[0].draw(x, y, width, height);
     }
 }
 
 ofTexture& ofxSpinnakerCamera::getTexture() {
-    return texture;
+    return texturePlanes[0];
+}
+
+const ofTexture& ofxSpinnakerCamera::getTexture() const {
+    return texturePlanes[0];
 }
 
 ofPixels& ofxSpinnakerCamera::getPixels() {
     return pixels;
+}
+
+const ofPixels& ofxSpinnakerCamera::getPixels() const {
+    return pixels;
+}
+
+bool ofxSpinnakerCamera::isFrameNew() const {
+    return frameIsNew;
+}
+
+void ofxSpinnakerCamera::close() {
+    shutdown();
+}
+
+bool ofxSpinnakerCamera::isInitialized() const {
+    return initializedFlag;
+}
+
+bool ofxSpinnakerCamera::setPixelFormat(ofPixelFormat pixelFormat) {
+    if (pixelFormat == OF_PIXELS_RGB || pixelFormat == OF_PIXELS_GRAY) {
+        outputPixelFormat.store(pixelFormat, std::memory_order_relaxed);
+        return true;
+    }
+    ofLogWarning("ofxSpinnakerCamera") << "setPixelFormat: only OF_PIXELS_RGB and OF_PIXELS_GRAY are supported "
+                                          "(the capture pipeline always converts through Spinnaker's ImageProcessor "
+                                          "to one of those two); ignoring the requested format.";
+    return false;
+}
+
+ofPixelFormat ofxSpinnakerCamera::getPixelFormat() const {
+    return outputPixelFormat.load(std::memory_order_relaxed);
+}
+
+std::vector<ofVideoDevice> ofxSpinnakerCamera::listDevices() const {
+    // This object represents one already-discovered camera, not a device
+    // enumerator - real multi-camera discovery is ofxSpinnaker's job
+    // (getNumCameras()/getCamera()). This just self-describes for code
+    // written against the generic ofBaseVideoGrabber interface.
+    ofVideoDevice device;
+    device.id = 0;
+    device.deviceName = deviceDisplayName;
+    device.hardwareName = deviceDisplayName;
+    device.serialID = serialNumber;
+    device.bAvailable = (camera != nullptr);
+    return {device};
+}
+
+bool ofxSpinnakerCamera::setup(int w, int h) {
+    (void)w;
+    (void)h;
+    if (isInitialized()) {
+        return true;
+    }
+    ofLogWarning("ofxSpinnakerCamera") << "setup(int,int) called before this camera was discovered/initialized by "
+                                          "ofxSpinnaker - real initialization happens automatically on discovery "
+                                          "(ofxSpinnaker::setup()/refreshCameraList()), not through this "
+                                          "compatibility entry point, so there's no hardware to set up here yet.";
+    return false;
+}
+
+float ofxSpinnakerCamera::getWidth() const {
+    return static_cast<float>(pixels.getWidth());
+}
+
+float ofxSpinnakerCamera::getHeight() const {
+    return static_cast<float>(pixels.getHeight());
+}
+
+void ofxSpinnakerCamera::setUseTexture(bool useTex) {
+    useTexture = useTex;
+}
+
+bool ofxSpinnakerCamera::isUsingTexture() const {
+    return useTexture;
+}
+
+std::vector<ofTexture>& ofxSpinnakerCamera::getTexturePlanes() {
+    return texturePlanes;
+}
+
+const std::vector<ofTexture>& ofxSpinnakerCamera::getTexturePlanes() const {
+    return texturePlanes;
 }
 
 const std::string& ofxSpinnakerCamera::getSerialNumber() const {
@@ -944,14 +1045,18 @@ void ofxSpinnakerCamera::OnImageEvent(Spinnaker::ImagePtr image) {
     }
 
     try {
-        ImagePtr converted = processor.Convert(image, PixelFormat_RGB8);
+        // setPixelFormat() only supports switching between the RGB8 default
+        // and grayscale (see its comment); anything else falls back to RGB8.
+        const bool grayscale = (outputPixelFormat.load(std::memory_order_relaxed) == OF_PIXELS_GRAY);
+        ImagePtr converted = processor.Convert(image, grayscale ? PixelFormat_Mono8 : PixelFormat_RGB8);
 
         std::unique_lock<std::mutex> lock(frameMutex);
         pixels.setFromPixels(static_cast<unsigned char*>(converted->GetData()),
                              converted->GetWidth(),
                              converted->GetHeight(),
-                             OF_IMAGE_COLOR);
+                             grayscale ? OF_IMAGE_GRAYSCALE : OF_IMAGE_COLOR);
         newFrameAvailable = true;
+        ++frameCount;
     } catch (const Spinnaker::Exception& e) {
         ofLogWarning("ofxSpinnakerCamera") << "Image conversion error on " << serialNumber << ": " << e.what();
     }
@@ -966,17 +1071,28 @@ void ofxSpinnakerCamera::buildParameterTree() {
     infoParameters.clear();
     liveParameters.clear();
     reconfigureParameters.clear();
+    naturalParameters.clear();
+    advancedParameters.clear();
     writableNodes.clear();
     enumDisplayNames.clear();
     enumValueMaps.clear();
     parameterPaths.clear();
     selectorParameterPaths.clear();
+    genicamNameToPath.clear();
+    pathToParameter.clear();
 
     rootParameters.setName(deviceDisplayName.empty() ? "Camera" : deviceDisplayName);
     infoParameters.setName("Info");
     liveParameters.setName("Live Controls");
     reconfigureParameters.setName("Reconfigure Controls");
+    naturalParameters.setName("Camera Controls");
+    advancedParameters.setName("Advanced Controls");
 
+    // Camera Controls/Advanced Controls first - they're the primary surface;
+    // Info/Live/Reconfigure are the raw fallback ("Full Settings" in the
+    // example GUI), built the same as before and left untouched.
+    rootParameters.add(naturalParameters);
+    rootParameters.add(advancedParameters);
     rootParameters.add(infoParameters);
     rootParameters.add(liveParameters);
     rootParameters.add(reconfigureParameters);
@@ -1007,6 +1123,9 @@ void ofxSpinnakerCamera::buildParameterTree() {
     } catch (const Spinnaker::Exception& e) {
         ofLogError("ofxSpinnakerCamera") << "Failed to traverse node map: " << e.what();
     }
+
+    buildNaturalControls();
+    buildAdvancedControls();
 }
 
 void ofxSpinnakerCamera::buildInfoGroup(INodeMap& nodeMap) {
@@ -1029,6 +1148,219 @@ void ofxSpinnakerCamera::buildInfoGroup(INodeMap& nodeMap) {
             infoParameters.add(param);
         }
     }
+}
+
+ofAbstractParameter* ofxSpinnakerCamera::findByGenICamName(const std::string& genicamName) const {
+    auto nameIt = genicamNameToPath.find(genicamName);
+    if (nameIt == genicamNameToPath.end()) {
+        return nullptr;
+    }
+    auto paramIt = pathToParameter.find(nameIt->second);
+    if (paramIt == pathToParameter.end()) {
+        return nullptr;
+    }
+    return paramIt->second;
+}
+
+void ofxSpinnakerCamera::addAliasToGroup(ofParameterGroup& target, std::initializer_list<std::string> candidateNames) {
+    for (const auto& genicamName : candidateNames) {
+        ofAbstractParameter* param = findByGenICamName(genicamName);
+        if (!param) {
+            continue;
+        }
+
+        auto pathIt = parameterPaths.find(param);
+        if (pathIt == parameterPaths.end()) {
+            return;
+        }
+        const std::string path = pathIt->second;
+        const std::string displayName = param->getName();
+
+        target.add(*param);
+
+        if (param->type() == typeid(ofParameter<int>).name()) {
+            ofParameter<int>& stored = target.get<int>(displayName);
+            parameterPaths[&stored] = path;
+        } else if (param->type() == typeid(ofParameter<float>).name()) {
+            ofParameter<float>& stored = target.get<float>(displayName);
+            parameterPaths[&stored] = path;
+        } else if (param->type() == typeid(ofParameter<bool>).name()) {
+            ofParameter<bool>& stored = target.get<bool>(displayName);
+            parameterPaths[&stored] = path;
+        } else if (param->type() == typeid(ofParameter<std::string>).name()) {
+            ofParameter<std::string>& stored = target.get<std::string>(displayName);
+            parameterPaths[&stored] = path;
+        }
+        return;
+    }
+}
+
+void ofxSpinnakerCamera::buildNaturalControls() {
+    naturalParameters.clear();
+    naturalParameters.setName("Camera Controls");
+
+    // Exposure, gain, white balance, and frame rate are standard GenICam SFNC
+    // features present on essentially every Spinnaker camera. Saturation and
+    // Hue are Point-Grey/Blackfly-lineage ISP extensions that aren't part of
+    // the documented GenICam surface at all (confirmed absent from the SDK's
+    // CameraDefs.h) - present on some cameras, absent on others, and their
+    // exact node names are a best guess from SFNC naming convention rather
+    // than a documented identifier, hence multiple candidates for those.
+    // Whatever findByGenICamName() can't find is simply skipped.
+    addAliasToGroup(naturalParameters, {"ExposureAuto"});
+    addAliasToGroup(naturalParameters, {"ExposureTime"});
+    addAliasToGroup(naturalParameters, {"GainAuto"});
+    addAliasToGroup(naturalParameters, {"Gain"});
+    addAliasToGroup(naturalParameters, {"BalanceWhiteAuto"});
+    addAliasToGroup(naturalParameters, {"BalanceRatioSelector"});
+    addAliasToGroup(naturalParameters, {"BalanceRatio"});
+    addAliasToGroup(naturalParameters, {"SaturationEnable", "SaturationEnabled"});
+    addAliasToGroup(naturalParameters, {"SaturationAuto"});
+    addAliasToGroup(naturalParameters, {"Saturation"});
+    addAliasToGroup(naturalParameters, {"HueEnable", "HueEnabled"});
+    addAliasToGroup(naturalParameters, {"Hue"});
+    addAliasToGroup(naturalParameters, {"AcquisitionFrameRateEnable"});
+    addAliasToGroup(naturalParameters, {"AcquisitionFrameRate"});
+    addAliasToGroup(naturalParameters, {"AcquisitionResultingFrameRate"});
+
+    // Measured, not requested: counts frames actually delivered through
+    // OnImageEvent rather than reading a target/theoretical rate, so it
+    // reflects reality even under packet loss (see AcquisitionResultingFrameRate
+    // above, which is the camera's own theoretical figure for comparison).
+    // Never registered in parameterPaths, so it always renders as read-only.
+    actualFpsParameter.set("Actual FPS", ofToString(measuredFps, 1) + " fps");
+    naturalParameters.add(actualFpsParameter);
+}
+
+void ofxSpinnakerCamera::buildFilteredPixelFormatControl() {
+    // Restrict to entries both offered by the camera and known to convert
+    // cleanly via Spinnaker::ImageProcessor::Convert() (our capture pipeline
+    // always converts every frame to RGB8) - of the SDK's ~253 PixelFormat
+    // entries, roughly 160+ are 3D/depth, confidence-map, compressed, or
+    // planar/signed/float variants ImageProcessor doesn't accept as input.
+    static const std::unordered_set<std::string> safePixelFormats = {
+        "Mono8", "Mono16",
+        "BayerRG8", "BayerGR8", "BayerGB8", "BayerBG8",
+        "BayerRG16", "BayerGR16", "BayerGB16", "BayerBG16",
+        "RGB8", "BGR8", "RGBa8", "BGRa8"
+    };
+
+    auto pathIt = genicamNameToPath.find("PixelFormat");
+    if (pathIt == genicamNameToPath.end()) {
+        return;
+    }
+    const std::string rawPath = pathIt->second;
+
+    auto namesIt = enumDisplayNames.find(rawPath);
+    auto valuesIt = enumValueMaps.find(rawPath);
+    auto nodeIt = writableNodes.find(rawPath);
+    if (namesIt == enumDisplayNames.end() || valuesIt == enumValueMaps.end() || nodeIt == writableNodes.end()) {
+        return;
+    }
+
+    const std::vector<std::string>& allNames = namesIt->second;
+    const std::map<int, int64_t>& allValues = valuesIt->second;
+
+    // Recover the camera's current pixel format symbolic name so the
+    // filtered index preserves the current selection rather than resetting
+    // to entry 0 every rebuild.
+    std::string currentSymbolic;
+    auto currentParamIt = pathToParameter.find(rawPath);
+    if (currentParamIt != pathToParameter.end() &&
+        currentParamIt->second->type() == typeid(ofParameter<int>).name()) {
+        const int currentRawIndex = currentParamIt->second->cast<int>().get();
+        if (currentRawIndex >= 0 && currentRawIndex < static_cast<int>(allNames.size())) {
+            currentSymbolic = allNames[currentRawIndex];
+        }
+    }
+
+    std::vector<std::string> filteredNames;
+    std::map<int, int64_t> filteredValues;
+    int currentFilteredIndex = 0;
+
+    for (size_t i = 0; i < allNames.size(); ++i) {
+        if (safePixelFormats.count(allNames[i]) == 0) {
+            continue;
+        }
+        auto valueIt = allValues.find(static_cast<int>(i));
+        if (valueIt == allValues.end()) {
+            continue;
+        }
+        const int filteredIndex = static_cast<int>(filteredNames.size());
+        filteredValues[filteredIndex] = valueIt->second;
+        if (allNames[i] == currentSymbolic) {
+            currentFilteredIndex = filteredIndex;
+        }
+        filteredNames.push_back(allNames[i]);
+    }
+
+    if (filteredNames.empty()) {
+        return;
+    }
+
+    // A separate synthetic path, not the raw PixelFormat one: this control's
+    // indices are remapped against the filtered list, not the camera's full
+    // enum, so it needs its own enumDisplayNames/enumValueMaps entry sharing
+    // only the underlying NodePtr (and therefore the real value) with the
+    // raw control in Full Settings.
+    const std::string syntheticPath = "Advanced/Pixel Format (Simple)";
+    enumDisplayNames[syntheticPath] = filteredNames;
+    enumValueMaps[syntheticPath] = filteredValues;
+    writableNodes[syntheticPath] = nodeIt->second;
+    // PixelFormat always requires the stream to be stopped to change -
+    // already confirmed empirically for the raw control by
+    // classifyControlGroups(). This synthetic control shares the same
+    // underlying node and therefore the same real constraint; there's no
+    // separate pre/post-stream probe to derive it from for a path that only
+    // exists here, so it's asserted directly instead.
+    nodeClassification[syntheticPath] = ofxSpinnakerControlClass::StopCaptureRequired;
+
+    ofParameter<int> parameter;
+    parameter.set("Pixel Format", currentFilteredIndex, 0, static_cast<int>(filteredNames.size() - 1));
+    advancedParameters.add(parameter);
+    ofParameter<int>& stored = advancedParameters.get<int>("Pixel Format");
+    parameterPaths[&stored] = syntheticPath;
+    pathToParameter[syntheticPath] = &stored;
+}
+
+void ofxSpinnakerCamera::buildAdvancedControls() {
+    advancedParameters.clear();
+    advancedParameters.setName("Advanced Controls");
+
+    // Resolution is deliberately limited to binning rather than free-form
+    // Width/Height/Offset sliders: binning is always camera-validated (its
+    // own min/max/increment), so there's no way to leave the camera in an
+    // invalid ROI state through this tier. Free-form ROI stays available in
+    // Full Settings for anyone who needs it.
+    addAliasToGroup(advancedParameters, {"BinningHorizontal"});
+    addAliasToGroup(advancedParameters, {"BinningVertical"});
+
+    buildFilteredPixelFormatControl();
+}
+
+void ofxSpinnakerCamera::updateMeasuredFps() {
+    const uint64_t now = ofGetElapsedTimeMillis();
+    if (fpsWindowStartMs == 0) {
+        fpsWindowStartMs = now;
+        return;
+    }
+
+    const uint64_t elapsedMs = now - fpsWindowStartMs;
+    if (elapsedMs < 1000) {
+        return;
+    }
+
+    uint64_t framesInWindow = 0;
+    {
+        std::lock_guard<std::mutex> lock(frameMutex);
+        framesInWindow = frameCount;
+        frameCount = 0;
+    }
+
+    measuredFps = static_cast<float>(framesInWindow) / (static_cast<float>(elapsedMs) / 1000.0f);
+    fpsWindowStartMs = now;
+
+    actualFpsParameter.set(ofToString(measuredFps, 1) + " fps");
 }
 
 void ofxSpinnakerCamera::traverseNode(NodePtr node,
@@ -1170,6 +1502,7 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                 container.add(parameter);
                 ofParameter<int>& stored = container.get<int>(displayName);
                 parameterPaths[&stored] = parameterPath;
+                pathToParameter[parameterPath] = &stored;
                 break;
             }
             case intfIFloat: {
@@ -1186,6 +1519,7 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                 container.add(parameter);
                 ofParameter<float>& stored = container.get<float>(displayName);
                 parameterPaths[&stored] = parameterPath;
+                pathToParameter[parameterPath] = &stored;
                 break;
             }
             case intfIInteger: {
@@ -1214,6 +1548,7 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                 container.add(parameter);
                 ofParameter<int>& stored = container.get<int>(displayName);
                 parameterPaths[&stored] = parameterPath;
+                pathToParameter[parameterPath] = &stored;
                 break;
             }
             case intfIBoolean: {
@@ -1227,6 +1562,7 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                 container.add(parameter);
                 ofParameter<bool>& stored = container.get<bool>(displayName);
                 parameterPaths[&stored] = parameterPath;
+                pathToParameter[parameterPath] = &stored;
                 break;
             }
             case intfIString: {
@@ -1240,6 +1576,7 @@ void ofxSpinnakerCamera::traverseNode(NodePtr node,
                 container.add(parameter);
                 ofParameter<std::string>& stored = container.get<std::string>(displayName);
                 parameterPaths[&stored] = parameterPath;
+                pathToParameter[parameterPath] = &stored;
                 break;
             }
             default:
@@ -1487,15 +1824,23 @@ bool ofxSpinnakerCamera::applyString(const std::string& path, NodePtr node, ofPa
 void ofxSpinnakerCamera::cacheNode(const std::string& path, NodePtr node) {
     if (!path.empty() && node) {
         writableNodes[path] = node;
+        // Stable GenICam identifier (e.g. "ExposureTime"), as opposed to the
+        // display name used for the path above - see buildNaturalControls().
+        genicamNameToPath[node->GetName().c_str()] = path;
     }
 }
 
 void ofxSpinnakerCamera::ensureTextureMatches(const ofPixels& pixelsRef) {
-    if (!texture.isAllocated() ||
-        texture.getWidth() != pixelsRef.getWidth() ||
-        texture.getHeight() != pixelsRef.getHeight() ||
-        texture.getTextureData().glInternalFormat != GL_RGB) {
-        texture.allocate(pixelsRef);
+    ofTexture& tex = texturePlanes[0];
+    // Format-aware (not hardcoded to GL_RGB) since setPixelFormat() can
+    // switch the delivered format to grayscale - comparing against a fixed
+    // GL_RGB would otherwise force a reallocation every single frame once
+    // running in grayscale mode.
+    if (!tex.isAllocated() ||
+        tex.getWidth() != pixelsRef.getWidth() ||
+        tex.getHeight() != pixelsRef.getHeight() ||
+        tex.getTextureData().glInternalFormat != ofGetGLInternalFormat(pixelsRef)) {
+        tex.allocate(pixelsRef);
     }
 }
 

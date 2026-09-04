@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,7 +57,18 @@ enum class ofxSpinnakerControlClass {
     StopCaptureRequired
 };
 
-class ofxSpinnakerCamera : public Spinnaker::ImageEventHandler {
+// ofxSpinnakerCamera doubles as an ofBaseVideoGrabber/ofBaseVideoDraws (the
+// same interfaces ofVideoGrabber itself implements), so it can be used as a
+// drop-in replacement in code written against those interfaces, or just by
+// matching call sites directly: update()/isFrameNew()/getPixels()/
+// getTexture()/draw() all behave the same way regardless of which capture
+// source is behind them. Camera selection/initialization is still Spinnaker-
+// specific (real setup happens through ofxSpinnaker's discovery, not the
+// interface's setup(int,int) below, which exists only to satisfy the
+// contract - see its comment).
+class ofxSpinnakerCamera : public Spinnaker::ImageEventHandler,
+                           public ofBaseVideoGrabber,
+                           public ofBaseVideoDraws {
 public:
     explicit ofxSpinnakerCamera(Spinnaker::CameraPtr cameraPtr);
     ~ofxSpinnakerCamera() override;
@@ -68,12 +80,41 @@ public:
     void stopStreaming();
     bool isStreaming() const;
 
-    void update();
-    void draw(float x, float y) const;
-    void draw(float x, float y, float width, float height) const;
+    void update() override;
+    void draw(float x, float y) const override;
+    void draw(float x, float y, float width, float height) const override;
 
-    ofTexture& getTexture();
-    ofPixels& getPixels();
+    ofTexture& getTexture() override;
+    const ofTexture& getTexture() const override;
+    ofPixels& getPixels() override;
+    const ofPixels& getPixels() const override;
+
+    // --- ofBaseVideo / ofBaseVideoGrabber / ofBaseVideoDraws contract ---
+    // (grouped here rather than interleaved with the addon's own API, since
+    // they exist for interchangeability with other capture sources, not as
+    // primary entry points)
+    bool isFrameNew() const override;
+    void close() override;
+    bool isInitialized() const override;
+    bool setPixelFormat(ofPixelFormat pixelFormat) override;
+    ofPixelFormat getPixelFormat() const override;
+
+    std::vector<ofVideoDevice> listDevices() const override;
+    // Compatibility stub: real initialization happens via ofxSpinnaker's
+    // discovery + this class's own no-arg setup(), already called by the
+    // time application code ever holds a reference to this object. If
+    // called on an already-initialized camera this is a no-op returning
+    // true; w/h are otherwise unused (matches ofBaseVideoGrabber's own
+    // "may be treated as a hint" contract, but ofFramework rarely calls this
+    // dynamically since it's only reached through the polymorphic interface).
+    bool setup(int w, int h) override;
+    float getWidth() const override;
+    float getHeight() const override;
+
+    void setUseTexture(bool useTex) override;
+    bool isUsingTexture() const override;
+    std::vector<ofTexture>& getTexturePlanes() override;
+    const std::vector<ofTexture>& getTexturePlanes() const override;
 
     const std::string& getSerialNumber() const;
     const std::string& getDeviceDisplayName() const;
@@ -109,6 +150,27 @@ private:
                       ofParameterGroup& reconfigureContainer,
                       const std::string& currentPath = "");
     void configureStreamBuffering();
+
+    // "Natural Camera" simplified tiers: curated views built by aliasing
+    // already-constructed parameters from the raw tree (via
+    // ofParameterGroup::add(), which shares the same underlying value -
+    // edits through either view stay in sync) rather than duplicating them.
+    // Looked up by each node's stable GenICam name (e.g. "ExposureTime"),
+    // not its display name, since display names vary by camera/vendor even
+    // for standard SFNC features (confirmed: this camera's
+    // AcquisitionFrameRateEnable displays as "Acquisition Frame Rate Control
+    // Enabled", not the SFNC default). Anything a given camera doesn't have
+    // is silently skipped.
+    void buildNaturalControls();
+    void buildAdvancedControls();
+    ofAbstractParameter* findByGenICamName(const std::string& genicamName) const;
+    // Tries each candidate name in order, aliasing the first that exists on
+    // this camera - used where the exact node name isn't nailed down by SFNC
+    // (e.g. Blackfly-lineage Hue/Saturation controls aren't part of the
+    // documented GenICam surface, so the precise spelling is a best guess).
+    void addAliasToGroup(ofParameterGroup& target, std::initializer_list<std::string> candidateNames);
+    void buildFilteredPixelFormatControl();
+    void updateMeasuredFps();
     void classifyControlGroups();
     void attachParameterListener();
     void rebuildParameters();
@@ -159,25 +221,58 @@ private:
 
     mutable std::mutex frameMutex;
     ofPixels pixels;
-    ofTexture texture;
+    // Single-element by construction (resized to 1 in the constructor) so
+    // getTexturePlanes() always has a valid entry to reference, even before
+    // the first frame arrives. getTexture() is just texturePlanes[0].
+    std::vector<ofTexture> texturePlanes;
     bool newFrameAvailable = false;
     bool streaming = false;
+
+    // ofBaseVideo contract state, unrelated to the addon's own GenICam state.
+    bool frameIsNew = false;
+    bool initializedFlag = false;
+    // Set from setPixelFormat() (main thread) and read from OnImageEvent
+    // (Spinnaker's own acquisition thread) - atomic rather than sharing
+    // frameMutex since it's a single small value, not part of the
+    // pixel/texture hand-off.
+    std::atomic<ofPixelFormat> outputPixelFormat{OF_PIXELS_RGB};
+    bool useTexture = true;
 
     // Only ever touched from OnImageEvent (Spinnaker's own acquisition
     // thread, called serially), so these don't need frameMutex.
     uint64_t lastIncompleteImageLogTime = 0;
     uint32_t incompleteImageCount = 0;
 
+    // Delivered-frame counter for the measured "Actual FPS" display (see
+    // updateMeasuredFps()). frameCount is incremented in OnImageEvent
+    // (Spinnaker's acquisition thread) and read/reset from update() (main
+    // thread), so it shares frameMutex with the pixel buffer rather than
+    // needing a separate lock.
+    uint64_t frameCount = 0;
+    uint64_t fpsWindowStartMs = 0;
+    float measuredFps = 0.0f;
+
     ofParameterGroup rootParameters;
     ofParameterGroup liveParameters;
     ofParameterGroup reconfigureParameters;
     ofParameterGroup infoParameters;
+    ofParameterGroup naturalParameters;
+    ofParameterGroup advancedParameters;
+    ofParameter<std::string> actualFpsParameter;
 
     std::unordered_map<std::string, NodePtr> writableNodes;
     std::unordered_map<std::string, std::vector<std::string>> enumDisplayNames;
     std::unordered_map<std::string, std::map<int, int64_t>> enumValueMaps;
     std::unordered_map<const ofAbstractParameter*, std::string> parameterPaths;
     std::unordered_set<std::string> selectorParameterPaths;
+
+    // Support lookups for buildNaturalControls()/buildAdvancedControls():
+    // a node's stable GenICam name (e.g. "ExposureTime") to its internal
+    // path, and that path back to the already-constructed ofParameter living
+    // in the raw tree, so curated tiers can alias real parameters instead of
+    // re-walking the node map or duplicating state.
+    std::unordered_map<std::string, std::string> genicamNameToPath;
+    std::unordered_map<std::string, ofAbstractParameter*> pathToParameter;
 
     // Discovered once per camera (see classifyControlGroups()): which nodes
     // actually require the stream to be stopped to change, versus which remain
