@@ -38,3 +38,9 @@ Thumbs.db
 
 # Large docs fetched locally
 Spinnaker-C-Plus-Plus-Programmer-Guide.pdf
+
+# OS / editor
+._*
+Desktop.ini
+*.swp
+.idea/
